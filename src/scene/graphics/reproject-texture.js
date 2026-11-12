@@ -1,6 +1,7 @@
-import { Debug, DebugHelper } from '../../core/debug.js';
+import { Debug } from '../../core/debug.js';
 import { random } from '../../core/math/random.js';
 import { Vec3 } from '../../core/math/vec3.js';
+import { Vec4 } from '../../core/math/vec4.js';
 import {
     FILTER_NEAREST,
     RENDERTARGET_ORIGIN_BOTTOM,
@@ -15,10 +16,11 @@ import { ChunkUtils } from '../shader-lib/chunk-utils.js';
 import { getProgramLibrary } from '../shader-lib/get-program-library.js';
 import { ShaderUtils } from '../shader-lib/shader-utils.js';
 import { BlendState } from '../../platform/graphics/blend-state.js';
-import { drawQuadWithShader } from './quad-render-utils.js';
+import { RenderPassShaderQuad } from './render-pass-shader-quad.js';
 
 /**
  * @import { Vec4 } from '../../core/math/vec4.js'
+ * @import { Shader } from '../../platform/graphics/shader.js'
  */
 
 const getProjectionName = (projection) => {
@@ -367,6 +369,122 @@ const generateGGXSamplesTex = (device, numSamples, specularPower, sourceTotalPix
     });
 };
 
+// Per-device resources reused across reprojectTexture calls. Reprojecting an environment atlas
+// runs dozens of these calls, each drawing into one face of a cubemap or a rectangle of a texture.
+// Creating a render target and a render pass per call, and destroying them again, allocates and
+// releases the framebuffers and the bind groups on every call, which shows as a stutter and a
+// climbing resource count while the lighting is generated repeatedly. The render targets keyed by
+// their target texture and face, and the render passes keyed by their shader, are created once and
+// reused instead. The DeviceCache destroys them when the device is destroyed.
+class ReprojectResources {
+    /**
+     * Render targets keyed by their target texture and, for a cubemap, its face. A render target
+     * only wraps a texture and holds no content of its own, so it can be reused on every
+     * reprojection into the same texture.
+     *
+     * @type {Map<string, RenderTarget>}
+     * @private
+     */
+    _renderTargets = new Map();
+
+    /**
+     * Quad render passes keyed by their shader. The pass keeps its QuadRender and its bind groups,
+     * and is re-initialized to the render target of each draw.
+     *
+     * @type {Map<Shader, RenderPassShaderQuad>}
+     * @private
+     */
+    _renderPasses = new Map();
+
+    /**
+     * Returns a render target rendering to the texture, reusing one created earlier for the same
+     * texture and cubemap face.
+     *
+     * @param {Texture} target - The texture rendered to.
+     * @param {number} face - The cubemap face, or 0 for a 2d texture.
+     * @param {string} name - The name of the render target.
+     * @returns {RenderTarget} The render target.
+     */
+    getRenderTarget(target, face, name) {
+        const key = `${target.id}:${face}`;
+        let renderTarget = this._renderTargets.get(key);
+
+        // a texture resized in place keeps its id, but the render target wraps its old, now stale
+        // framebuffer and dimensions, so rebuild it for the new size
+        if (renderTarget && (renderTarget.width !== target.width || renderTarget.height !== target.height)) {
+            renderTarget.destroy();
+            this._renderTargets.delete(key);
+            renderTarget = null;
+        }
+
+        if (!renderTarget) {
+            renderTarget = new RenderTarget({
+                name,
+                colorBuffer: target,
+                face,
+                depth: false,
+                origin: RENDERTARGET_ORIGIN_BOTTOM
+            });
+            this._renderTargets.set(key, renderTarget);
+        }
+        return renderTarget;
+    }
+
+    /**
+     * Returns a render pass for the shader, reusing one created earlier with the same shader, and
+     * initializes it to render into the render target.
+     *
+     * @param {Shader} shader - The shader drawing the quad.
+     * @param {RenderTarget} renderTarget - The render target to draw into.
+     * @returns {RenderPassShaderQuad} The initialized render pass.
+     */
+    getRenderPass(shader, renderTarget) {
+        let renderPass = this._renderPasses.get(shader);
+        if (!renderPass) {
+            renderPass = new RenderPassShaderQuad(shader.device);
+            renderPass.shader = shader;
+            this._renderPasses.set(shader, renderPass);
+        }
+
+        // re-initializing switches the attachments and resets their clear and store operations
+        renderPass.init(renderTarget);
+        return renderPass;
+    }
+
+    /**
+     * Releases the render targets whose target texture was destroyed elsewhere. The render passes
+     * do not reference a texture once re-initialized, but their number is bounded by the shaders,
+     * which are cached, so they are kept until the device is destroyed.
+     */
+    pruneRenderTargets() {
+        for (const [key, renderTarget] of this._renderTargets) {
+            if (!renderTarget.colorBuffer?.device) {
+                renderTarget.destroy();
+                this._renderTargets.delete(key);
+            }
+        }
+    }
+
+    destroy() {
+        this._renderTargets.forEach(renderTarget => renderTarget.destroy());
+        this._renderTargets.clear();
+
+        this._renderPasses.forEach(renderPass => renderPass.destroy());
+        this._renderPasses.clear();
+    }
+}
+
+// per-device reusable render targets and render passes
+const reprojectResourcesCache = new DeviceCache();
+
+const getReprojectResources = (device) => {
+    return reprojectResourcesCache.get(device, () => new ReprojectResources());
+};
+
+// viewport covering the whole render target, reused when no rect is given. It matches the default
+// viewport drawQuadWithShader sets, without allocating on each call
+const _fullViewport = new Vec4();
+
 /**
  * This function reprojects textures between cubemap, equirectangular and octahedral formats. The
  * function can read and write textures with pixel data in RGBE, RGBM, linear and sRGB formats.
@@ -489,26 +607,37 @@ function reprojectTexture(source, target, options = {}) {
         device.scope.resolve('samplesTexInverseSize').setValue([1.0 / samplesTex.width, 1.0 / samplesTex.height]);
     }
 
+    // reuse the render targets and the render pass across calls, so generating an environment
+    // atlas does not allocate and destroy a framebuffer and bind groups per face and per call
+    const resources = getReprojectResources(device);
+    resources.pruneRenderTargets();
+
+    const renderTargetName = {
+        none: 'Reproject',
+        phong: 'PrefilterPhong',
+        ggx: 'PrefilterGGX',
+        lambert: 'PrefilterLambert'
+    }[distribution] ?? 'Reproject';
+
     for (let f = 0; f < (target.cubemap ? 6 : 1); f++) {
         if (face === null || f === face) {
-            const renderTarget = new RenderTarget({
-                colorBuffer: target,
-                face: f,
-                depth: false,
-                origin: RENDERTARGET_ORIGIN_BOTTOM
-            });
-            DebugHelper.setName(renderTarget, {
-                none: 'Reproject',
-                phong: 'PrefilterPhong',
-                ggx: 'PrefilterGGX',
-                lambert: 'PrefilterLambert'
-            }[distribution] ?? 'Reproject');
+            const renderTarget = resources.getRenderTarget(target, f, renderTargetName);
+            const renderPass = resources.getRenderPass(shader, renderTarget);
+
+            // the quad is drawn with the blend state currently set on the device, as
+            // drawQuadWithShader did, and into the viewport rectangle, or the whole target
+            renderPass.blendState = device.blendState;
+            if (options?.rect) {
+                renderPass.viewport = options.rect;
+            } else {
+                renderPass.viewport = _fullViewport.set(0, 0, renderTarget.width, renderTarget.height);
+            }
+            renderPass.scissor = undefined;
+
             params[0] = f;
             constantParams.setValue(params);
 
-            drawQuadWithShader(device, renderTarget, shader, options?.rect, undefined, renderTarget.name);
-
-            renderTarget.destroy();
+            renderPass.render();
         }
     }
 
